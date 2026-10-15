@@ -6,6 +6,14 @@ triggers the `robonix/skill/explore/explore` tool).
 
 See `CAPABILITY.md` for the full interface + behaviour spec.
 
+Exploration duration, first-map wait, navigation legs, sweeps and settling use
+the deployment's selected `reference`. The controller's ROS node uses simulation
+time for `ros_time`. Status queries, cancellation requests, failure backoff and
+shutdown joins retain real limits. Reference interruption or generation change
+ends the task and cancels its navigation run; old map, pose and coverage data
+cannot continue in a new generation. Repeated frozen evidence does not declare
+exploration complete. Quiet completion requires changed map or pose evidence.
+
 ## Quickstart
 
 ```bash

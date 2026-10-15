@@ -1,7 +1,6 @@
 # Runtime config accepted by the Explore skill.
 #
-# The package consumes no package-level `config:` fields. Keep the deployment
-# entry empty instead of placing per-request limits here. Exploration limits
+# The package accepts the deployment's inherited reference. Exploration limits
 # belong to each robonix/skill/explore/explore request:
 #
 # - area_hint: string describing the requested exploration area.
@@ -10,4 +9,7 @@
 #
 # This file is documentation only and is not loaded by the provider.
 
-config: {}
+config:
+  reference:
+    kind: linux_system  # linux_system | ros_time
+    provider_id: chronos  # used for ros_time

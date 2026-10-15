@@ -21,6 +21,7 @@ log = logging.getLogger("explore_rbnx")
 
 explore_skill = Skill(id="explore", namespace="robonix/skill/explore")
 ctrl: ExploreController | None = None
+_reference_config = None
 
 # Atlas-resolved inputs the skill consumes. Hard-fail if any required
 # input isn't atlas-resolvable: the packaging-spec rule is "no hardcoded
@@ -52,8 +53,8 @@ def _close_inputs() -> None:
 
 def resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
     resolved: dict[str, str] = {}
-    deadline = time.time() + deadline_s
-    while time.time() < deadline:
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
         for key, (cid, transport) in REQUIRED_INPUTS.items():
             if key in resolved:
                 continue
@@ -171,10 +172,9 @@ def cancel(req: CancelExplore_Request) -> CancelExplore_Response:
 # subs, frontier loop, …). See docs/cap-lifecycle.md for the full FSM.
 @explore_skill.on_init
 def init(cfg):
-    """CMD_INIT: light. The state machine wants every cap to reach
-    INITIALIZED at boot time even if its upstream peers are still warming
-    up — so we deliberately don't query atlas for nav / map here. cfg is
-    accepted for forward-compat (no manifest knobs declared yet)."""
+    """Store config without waiting for navigation or map discovery."""
+    global _reference_config
+    _reference_config = cfg.get("reference")
     log.info("CMD_INIT ok")
     return Ok()
 
@@ -197,14 +197,24 @@ def activate():
             nav_navigate_endpoint=inputs["nav_navigate"],
             nav_status_endpoint=inputs["nav_status"],
             nav_cancel_endpoint=inputs["nav_cancel"],
+            reference=_reference_config,
         )
         ctrl.start_runtime()
     except Exception:
-        ctrl = None
-        _close_inputs()
+        try:
+            if ctrl is not None:
+                ctrl.stop_runtime()
+        finally:
+            ctrl = None
+            _close_inputs()
         raise
     log.info("CMD_ACTIVATE ok — controller running")
     return Ok()
+
+
+@explore_skill.on_shutdown
+def shutdown():
+    return deactivate()
 
 
 @explore_skill.on_deactivate
