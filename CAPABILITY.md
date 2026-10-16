@@ -52,19 +52,22 @@ Passing an empty `run_id` uses the most recent exploration task.
 
 ## Behaviour
 
-1. Wait for `/map` (mapping service publishes it).
-2. Loop:
-   - Find frontier cells (free cells adjacent to unknown).
-   - Cluster them with size ≥ 8 cells; reject any centroid
-     - within 30 cm of an obstacle (skill-side safety filter), or
-     - more than 6 m from the robot (local exploration only), or
-     - inside cells we've already visited
-   - Pick highest-scoring frontier (info_gain ÷ travel_cost).
-   - Send goal via `service/navigation/navigate` MCP; poll status.
-   - On arrival, conditionally do a 360° in-place sweep to fill
-     camera viewing-angle coverage at the leg endpoint.
-3. Declare `done` when 0 frontier clusters remain and area hasn't
-   grown for 30 seconds.
+1. Wait for the occupancy grid (the mapping service publishes it).
+2. Loop until done:
+   - Find frontier cells (free cells next to unknown) and cluster them.
+     Cells the robot has driven over or cannot see under itself count as
+     free; the navigation costmap's lethal cells and Scene's furniture
+     count as obstacles.
+   - Choose a frontier with the configured strategy: `frontier_greedy`
+     (default) scores each by its size over the distance to it; `mrtsp`
+     orders them as Liu et al. (2025) do and visits the first. Frontiers
+     already reached or failed are skipped.
+   - Send the robot to a goal short of the frontier, where its chassis
+     fits, facing it, through `service/navigation/navigate`; poll status.
+3. End `done` when no frontier is left or every remaining one has been
+   tried; `error` when navigation fails 5 legs in a row, the map has not
+   grown for 180 s, or (with `frontier_greedy`) no frontier is reachable
+   even after turning in place.
 
 ## What this skill does NOT do
 
@@ -88,6 +91,14 @@ hardcoded inter-package topic names.
 
 Skill refuses to start if any of these is missing — there is no
 hardcoded fallback (packaging-spec invariant #1).
+
+Optional, used when atlas has them and skipped otherwise:
+
+| contract                              | used for                                   |
+|---------------------------------------|--------------------------------------------|
+| robonix/service/navigation/costmap    | obstacles the occupancy grid lacks (table tops a camera sees) |
+| robonix/system/scene/list_objects     | furniture as keep-out circles              |
+| robonix/system/soma/footprint         | the robot's radius                          |
 
 ## Portability
 

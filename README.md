@@ -6,13 +6,14 @@ triggers the `robonix/skill/explore/explore` tool).
 
 See `CAPABILITY.md` for the full interface + behaviour spec.
 
-Exploration duration, first-map wait, navigation legs, sweeps and settling use
-the deployment's selected `reference`. The controller's ROS node uses simulation
-time for `ros_time`. Status queries, cancellation requests, failure backoff and
-shutdown joins retain real limits. Reference interruption or generation change
-ends the task and cancels its navigation run; old map, pose and coverage data
-cannot continue in a new generation. Repeated frozen evidence does not declare
-exploration complete. Quiet completion requires changed map or pose evidence.
+Exploration duration, first-map wait, navigation legs, sweeps, settling and
+cached obstacle data age use the deployment's selected `reference`. The
+controller's ROS node uses simulation time for `ros_time`. Status queries,
+cancellation requests, failure backoff and shutdown joins retain real limits.
+Reference interruption ends tasks, including those without a duration limit,
+and cancels their navigation runs. Old map, pose, costmap, Scene cache and
+visited history cannot continue in a new generation. Progress deadlines stay
+frozen during a pause. A current map with no frontiers can finish immediately.
 
 ## Quickstart
 
@@ -46,8 +47,11 @@ explore_rbnx/
 │   └── srv/{Explore,GetExploreStatus,CancelExplore}.srv
 ├── explore_skill/           # python module
 │   ├── atlas_bridge.py      # entrypoint: register + serve MCP
-│   ├── frontier.py          # WFD + clustering + scoring + safety
-│   └── controller.py        # state machine, frontier loop, sweep
+│   ├── controller.py        # task state machine and frontier loop
+│   ├── frontier.py          # frontier search, clustering, goals, costmap overlay
+│   ├── strategies.py        # frontier_greedy and mrtsp
+│   ├── map_opt.py           # map cleaning for mrtsp
+│   └── soma.py              # robot radius from Soma's footprint
 ├── scripts/{build,start}.sh
 ├── docker/{Dockerfile, entrypoint.sh, no_shm_profile.xml}
 ├── CAPABILITY.md            # LLM-readable spec (registered with atlas)

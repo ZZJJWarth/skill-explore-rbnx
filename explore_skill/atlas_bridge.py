@@ -38,6 +38,58 @@ REQUIRED_INPUTS = {
     "nav_cancel":    ("robonix/service/navigation/navigate/cancel", "mcp"),
 }
 
+# Optional: Scene's objects from the camera mark tables the lidar sees
+# through. Without Scene, exploration runs on the map alone.
+OPTIONAL_INPUTS = {
+    "scene_objects": ("robonix/system/scene/list_objects", "mcp"),
+    # The robot's size. Without Soma, frontier.ROBOT_RADIUS_M is used.
+    "soma_footprint": ("robonix/system/soma/footprint", "grpc"),
+    # Navigation's global costmap: table tops the head camera saw, which
+    # the lidar's map lacks. Without it goals are placed on the map alone.
+    "costmap": ("robonix/service/navigation/costmap", "ros2"),
+}
+
+
+def robot_radius_from_soma(endpoint: str | None) -> float | None:
+    """Clearance radius from Soma's footprint, or None to use the default."""
+    if not endpoint:
+        log.warning("no Soma footprint on atlas; using the default robot "
+                    "radius")
+        return None
+    from explore_skill.soma import fetch_robot_radius
+    try:
+        radius = fetch_robot_radius(endpoint)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Soma footprint unusable (%s); using the default robot "
+                    "radius", e)
+        return None
+    log.info("robot radius from Soma footprint: %.3f m", radius)
+    return radius
+
+
+def resolve_optional_inputs() -> dict[str, str]:
+    """One attempt each, no waiting and no raising."""
+    resolved: dict[str, str] = {}
+    for key, (cid, transport) in OPTIONAL_INPUTS.items():
+        try:
+            cap_view = ATLAS.find_unique_capability(
+                contract_id=cid, transport=transport,
+            )
+            ch = explore_skill.connect_capability(cap_view, cid, transport)
+        except Exception:  # noqa: BLE001
+            log.info("optional input %s not on atlas; continuing without it",
+                     cid)
+            continue
+        ep = ch.endpoint
+        if ep:
+            # Held open with the required inputs, see _input_channels.
+            _input_channels.append(ch)
+            resolved[key] = ep
+            log.info("resolved optional %s [%s] → %s", cid, transport, ep)
+        else:
+            ch.close()
+    return resolved
+
 
 # Channels to the inputs the controller uses while the skill is ACTIVE. They
 # stay open until CMD_DEACTIVATE: they are how Atlas knows explore depends on
@@ -170,12 +222,26 @@ def cancel(req: CancelExplore_Request) -> CancelExplore_Response:
 # executor sends Driver(CMD_ACTIVATE) just-in-time on the first MCP
 # call, which is when the skill actually allocates hot resources (ROS
 # subs, frontier loop, …). See docs/cap-lifecycle.md for the full FSM.
+# Package config, read at CMD_INIT and used when the controller is built.
+_config: dict = {}
+
+
 @explore_skill.on_init
 def init(cfg):
-    """Store config without waiting for navigation or map discovery."""
+    """CMD_INIT: light. The state machine wants every cap to reach
+    INITIALIZED at boot time even if its upstream peers are still warming
+    up — so we deliberately don't query atlas for nav / map here. The
+    config is checked here, so a bad value fails at boot rather than on
+    the first request."""
+    from explore_skill.strategies import DEFAULT_STRATEGY, config_problem
     global _reference_config
     _reference_config = cfg.get("reference")
-    log.info("CMD_INIT ok")
+    _config.clear()
+    _config.update(cfg or {})
+    problem = config_problem(_config)
+    if problem:
+        return Err(problem)
+    log.info("CMD_INIT ok (strategy=%s)", _config.get("strategy") or DEFAULT_STRATEGY)
     return Ok()
 
 
@@ -190,7 +256,9 @@ def activate():
         log.info("CMD_ACTIVATE — already runnable, no-op")
         return Ok()
     inputs = resolve_inputs()
-    log.info("dependencies resolved: %s", list(inputs.keys()))
+    optional = resolve_optional_inputs()
+    log.info("dependencies resolved: %s (optional: %s)",
+             list(inputs.keys()), list(optional.keys()) or "none")
     try:
         ctrl = ExploreController(
             map_topic=inputs["map_topic"],
@@ -198,6 +266,12 @@ def activate():
             nav_status_endpoint=inputs["nav_status"],
             nav_cancel_endpoint=inputs["nav_cancel"],
             reference=_reference_config,
+            scene_objects_endpoint=optional.get("scene_objects"),
+            strategy=_config.get("strategy"),
+            mrtsp=_config.get("mrtsp"),
+            costmap_topic=optional.get("costmap"),
+            robot_radius_m=robot_radius_from_soma(
+                optional.get("soma_footprint")),
         )
         ctrl.start_runtime()
     except Exception:

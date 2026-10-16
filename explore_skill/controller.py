@@ -29,8 +29,8 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Tuple
 
 from robonix_api._reference_time import _ReferenceClock
 
@@ -49,49 +49,109 @@ class TaskHandle:
     initial_area_m2: float = 0.0
     last_area_m2: float = 0.0
     last_progress_t: float = 0.0
+    area_at_last_progress_m2: float = 0.0
     cancel_requested: bool = False
     legs_completed: int = 0           # successful nav legs in this task
+    # Frontiers navigation could not reach, and frontiers reached; both are
+    # skipped afterwards (one still there after a visit cannot be cleared
+    # from that goal: glass, beyond lidar range).
+    failed_targets: list = field(default_factory=list)
+    reached_targets: list = field(default_factory=list)
+    close_visits: list = field(default_factory=list)   # second, close looks
+    consecutive_nav_failures: int = 0
+    empty_sweeps: int = 0             # sweeps in a row that found no target
     thread: Optional[threading.Thread] = None
     reference: tuple | None = None
     elapsed_s: float = 0.0
     nav_run_id: str = ""
 
 
+@dataclass
+class _View:
+    """One round's map as frontier search sees it."""
+    grid: Any
+    pose: Optional[Tuple[float, float]]
+    yaw: float
+    area_m2: float
+    frontiers: int
+    min_size: int
+    visited: set
+
+
+@dataclass
+class _Step:
+    """What a round does: drive to `target`, wait for a pose, turn in
+    place, or end the task with `end` = (state, detail)."""
+    target: Any = None
+    close: bool = False               # a second, close look at `target`
+    wait: bool = False
+    sweep: bool = False
+    end: Optional[Tuple[str, str]] = None
+
+
 class ExploreController:
     """Frontier-loop controller. One instance per service process;
     one active task at a time."""
 
-    # Tunables
-    FRONTIER_MIN_SIZE_CELLS = 3           # below this = noise, ignore
-    DONE_QUIET_SECONDS = 30.0             # no progress for this long → done
-    PROGRESS_AREA_DELTA_M2 = 1.0          # area gain considered "progress"
+    # Frontier search
+    FRONTIER_MIN_SIZE_CELLS = 8           # smaller clusters are lidar speckle
+    MAX_FRONTIER_DISTANCE_M = 6.0         # preferred radius; farther when none is nearer
+    CLOSE_LOOK_MIN_SIZE_CELLS = 20        # frontiers this long get a second, close look
+    FAILED_TARGET_RADIUS_M = 1.0          # skip frontiers this close to a failed one
+    VISITED_RADIUS_M = 0.4                # cells around each pose marked visited
+    VISITED_STEP_M = 0.2                  # poses are kept this far apart
+    # The lidar's blind zone leaves the ground around the robot unknown;
+    # these cells count as free so the robot is not ringed by frontiers.
+    BLIND_RADIUS_M = 0.6
+    # Goal clearance and standoff; None takes the robot radius and
+    # frontier.DEFAULT_STANDOFF_M.
+    TARGET_CLEARANCE_M = None
+    TARGET_STANDOFF_M = None
+
+    # When a task ends
+    NO_PROGRESS_TIMEOUT_S = 180.0         # map not grown this long: stop
+    PROGRESS_AREA_DELTA_M2 = 1.0          # growth that counts as progress
+    MAX_CONSECUTIVE_NAV_FAILURES = 5
+    MAX_EMPTY_SWEEPS = 2                  # in-place turns in a row with no goal
+
+    # Navigation legs
     NAV_POLL_PERIOD_S = 1.0
-    NAV_GOAL_TIMEOUT_S = 60.0             # per-leg cap; not the global timeout
-    LOOP_QUIET_PERIOD_S = 2.0             # delay between consecutive goals
-    # "Local exploration" radius: candidates farther than this from
-    # current robot pose are skipped. Forces the skill to clear the
-    # current room before jumping to a far-away frontier.
-    MAX_FRONTIER_DISTANCE_M = 6.0
-    # Mark cells within this radius of the robot as "visited" each
-    # time we update the pose. Used to deprioritise re-revisiting
-    # already-cleared areas when multiple frontiers tie in score.
-    VISITED_RADIUS_M = 0.4
-    # Coverage tracking: each cell records which yaw sectors the
-    # camera has pointed at. 8 sectors of 45° each. A cell with all
-    # 8 sectors filled has been observed from every direction.
-    YAW_SECTORS = 8
-    # A 360° sweep is expensive for wheel odometry, so only perform it
-    # periodically and when the current cell still lacks yaw coverage.
-    # Previously the OR condition swept at every newly reached cell,
-    # accumulating rotation drift and starving the global timeout.
-    SWEEP_MIN_SECTORS = 6
-    SWEEP_EVERY_N_LEGS = 3
+    NAV_GOAL_TIMEOUT_S = 60.0             # minimum per leg
+    LEG_TIMEOUT_PER_M_S = 7.0             # per metre of path, above the minimum
+    LOOP_QUIET_PERIOD_S = 2.0             # pause between legs
+
+    # Scene objects as keep-out circles
+    KEEPOUT_TTL_S = 10.0                  # reuse a snapshot this long
+    # Only objects whose vertical extent meets the robot's are in its way:
+    # not a ceiling lamp or a picture on the wall, and not a rug.
+    KEEPOUT_FLOOR_M = 0.05
+    KEEPOUT_ROBOT_HEIGHT_M = 1.5
 
     def __init__(self, *, map_topic: str,
                  nav_navigate_endpoint: str,
                  nav_status_endpoint: str,
-                 nav_cancel_endpoint: str, reference=None):
+                 nav_cancel_endpoint: str,
+                 scene_objects_endpoint: Optional[str] = None,
+                 strategy: Optional[str] = None,
+                 robot_radius_m: Optional[float] = None,
+                 mrtsp: Optional[dict] = None,
+                 costmap_topic: Optional[str] = None, reference=None):
+        from .frontier import ROBOT_RADIUS_M
+        from .strategies import DEFAULT_STRATEGY, validate
         self.map_topic = map_topic
+        # Which frontier to go to next; see strategies.py.
+        self.strategy = validate(strategy or DEFAULT_STRATEGY)
+        self.robot_radius_m = robot_radius_m or ROBOT_RADIUS_M
+        # mrtsp's parameters (strategies.MRTSP_DEFAULTS).
+        self.mrtsp = dict(mrtsp or {})
+        # Navigation's global costmap (robonix/service/navigation/costmap),
+        # whose lethal cells goals keep away from (frontier.overlay_lethal).
+        # None: the map alone.
+        self.costmap_topic = costmap_topic or None
+        self._latest_costmap: Any = None
+        self._costmap_received = 0.0
+        self._costmap_reference = None
+        self._costmap_notes: set = set()
         # All three nav endpoints typically point at the same FastMCP
         # server (http://host:port/mcp/) — atlas hands us the URL each
         # tool registered under. Keep separate fields so a future
@@ -102,17 +162,21 @@ class ExploreController:
             "status":   nav_status_endpoint,
             "cancel":   nav_cancel_endpoint,
         }
+        # Optional: Scene sees what the lidar cannot. None means this
+        # deployment has no Scene, and exploration proceeds without the
+        # extra keep-outs exactly as it did before.
+        self._scene_endpoint = scene_objects_endpoint
+        self._keepout_cache: List[Tuple[float, float, float]] = []
+        self._keepout_stamp = None
+        self._keepout_reference = None
         self._lock = threading.Lock()
         self._latest_map: Any = None     # latest OccupancyGrid msg
         self._latest_pose_xyyaw: Optional[Tuple[float, float, float]] = None
-        # Visited cells (set of (cx, cy) cell-space ints). Reset per
-        # task so a second explore() doesn't inherit stale state.
-        self._visited_cells: set = set()
-        # Per-cell viewing-angle coverage: dict[(cx,cy), set[int]]
-        # where the int is a sector index in [0, YAW_SECTORS).
-        # Used to decide whether to insert a 360° sweep at this cell
-        # and to evaluate "fully observed" coverage at done-time.
-        self._viewed_sectors: dict = {}
+        # Where the robot has been this task, in map metres rounded to
+        # VISITED_STEP_M. Positions, not cells: a SLAM map that grows moves
+        # its origin, and cells recorded against an earlier map would land
+        # somewhere else on the next one.
+        self._visited_xy: set = set()
         self._task: Optional[TaskHandle] = None
 
         self._ros: Optional[dict] = None
@@ -155,6 +219,10 @@ class ExploreController:
                       history=Hist.KEEP_LAST, depth=1)
         node.create_subscription(self._ros["OccupancyGrid"],
                                   self.map_topic, self._on_map, map_qos)
+        if self.costmap_topic:
+            node.create_subscription(self._ros["OccupancyGrid"],
+                                     self.costmap_topic, self._on_costmap,
+                                     map_qos)
 
         # tf2 for map→base_link lookup (so we know where the robot is)
         from tf2_ros import Buffer, TransformListener
@@ -201,8 +269,12 @@ class ExploreController:
                     with self._lock:
                         self._latest_map = self._latest_pose_xyyaw = None
                         self._map_reference = self._pose_reference = None
-                        self._visited_cells.clear()
-                        self._viewed_sectors.clear()
+                        self._visited_xy.clear()
+                        self._latest_costmap = None
+                        self._costmap_reference = None
+                        self._keepout_cache = []
+                        self._keepout_stamp = None
+                        self._keepout_reference = None
                         self._tf_buffer.clear()
                 self._runtime_reference = identity
                 self._refresh_robot_pose()
@@ -219,9 +291,59 @@ class ExploreController:
             self._latest_map = msg
             self._map_reference = reading
 
+    # A costmap received longer ago than this is not used: navigation
+    # publishes the whole grid about once a second, so an older one means it
+    # stopped, and its marks may no longer match the map.
+    COSTMAP_MAX_AGE_S = 5.0
+
+    def _with_costmap(self, gv, map_msg):
+        """`gv` with the costmap's lethal cells, or `gv` unchanged when there
+        is no costmap, it is stale, or its frame cannot be put in the map's."""
+        from .frontier import overlay_lethal
+        with self._lock:
+            cm, received = self._latest_costmap, self._costmap_received
+        if cm is None:
+            return gv
+        reading = self._reference.read()
+        if reading is None or self._costmap_reference is None or reading[1:] != self._costmap_reference[1:]:
+            return gv
+        age = reading[0] / 1e9 - received
+        if age > self.COSTMAP_MAX_AGE_S:
+            self._costmap_note("costmap received %.1f s ago; not used", age)
+            return gv
+        src, dst = cm.header.frame_id, map_msg.header.frame_id
+        tf = (0.0, 0.0, 0.0)
+        if src and dst and src != dst:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    dst, src, self._ros["rclpy"].time.Time()).transform
+                q = t.rotation
+                tf = (t.translation.x, t.translation.y,
+                      math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                 1 - 2 * (q.y * q.y + q.z * q.z)))
+            except Exception as e:  # noqa: BLE001
+                self._costmap_note("no transform %s <- %s (%s); costmap not "
+                                   "used", dst, src, e)
+                return gv
+        return overlay_lethal(gv, cm, tf)
+
+    def _costmap_note(self, fmt, *args) -> None:
+        """Log why the costmap was skipped, once per reason."""
+        key = fmt.split(";")[0][:24]
+        if key not in self._costmap_notes:
+            self._costmap_notes.add(key)
+            log.warning(fmt, *args)
+
+    def _on_costmap(self, msg) -> None:
+        reading = self._reference.read()
+        if reading is None:
+            return
+        with self._lock:
+            self._latest_costmap, self._costmap_received = msg, reading[0] / 1e9
+            self._costmap_reference = reading
+
     def _refresh_robot_pose(self) -> None:
-        """Look up map→base_link; record (x,y,yaw); update visited
-        cells + per-cell viewing-angle coverage."""
+        """Look up map→base_link; record (x,y,yaw) and where it has been."""
         if self._tf_buffer is None:
             return
         initial = self._reference.read()
@@ -229,9 +351,8 @@ class ExploreController:
             return
         try:
             from rclpy.time import Time
-            tr = self._tf_buffer.lookup_transform(
-                "map", "base_link", Time(),
-                timeout=self._ros["Duration"](seconds=0.5))
+            # This thread delivers TF callbacks too; retry on the next spin.
+            tr = self._tf_buffer.lookup_transform("map", "base_link", Time())
         except Exception:
             return
         x = float(tr.transform.translation.x)
@@ -246,27 +367,31 @@ class ExploreController:
         with self._lock:
             self._latest_pose_xyyaw = (x, y, yaw)
             self._pose_reference = reading
-            self._mark_visited(x, y, yaw)
+            step = self.VISITED_STEP_M
+            self._visited_xy.add((round(x / step), round(y / step)))
 
-    def _mark_visited(self, x: float, y: float, yaw: float) -> None:
-        """Stamp visited cells (radius-disk) and add the current yaw
-        sector to the per-cell coverage map. Called with self._lock."""
-        if self._latest_map is None:
-            return
-        from .frontier import GridView
-        gv = GridView.from_msg(self._latest_map)
-        cx, cy = gv.world_to_cell(x, y)
+    def _blind_cells(self, gv, pose) -> set:
+        """Cells within BLIND_RADIUS_M of `pose`; empty without a pose."""
+        if pose is None:
+            return set()
+        cx, cy = gv.world_to_cell(pose[0], pose[1])
+        r = max(1, int(round(self.BLIND_RADIUS_M / gv.resolution)))
+        return {(cx + dx, cy + dy)
+                for dy in range(-r, r + 1) for dx in range(-r, r + 1)
+                if dx * dx + dy * dy <= r * r}
+
+    def _visited_cells(self, gv, visited_xy: set) -> set:
+        """The cells of `gv` within VISITED_RADIUS_M of where the robot has
+        been, found on this map from the recorded positions."""
         r = max(1, int(round(self.VISITED_RADIUS_M / gv.resolution)))
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dx * dx + dy * dy <= r * r:
-                    self._visited_cells.add((cx + dx, cy + dy))
-        # Yaw normalised to [0, 2π) → sector index in [0, YAW_SECTORS).
-        sector = int(((yaw % (2 * math.pi)) / (2 * math.pi))
-                     * self.YAW_SECTORS) % self.YAW_SECTORS
-        self._viewed_sectors.setdefault((cx, cy), set()).add(sector)
+        disk = [(dx, dy) for dy in range(-r, r + 1) for dx in range(-r, r + 1)
+                if dx * dx + dy * dy <= r * r]
+        cells = set()
+        for qx, qy in visited_xy:
+            cx, cy = gv.world_to_cell(qx * self.VISITED_STEP_M, qy * self.VISITED_STEP_M)
+            cells.update((cx + dx, cy + dy) for dx, dy in disk)
+        return cells
 
-    # ── Public API (called from MCP tool handlers) ─────────────────
     def start(self, *, area_hint: str, timeout_s: float,
               max_speed_m_s: float) -> TaskHandle:
         reading = self._read_reference()
@@ -278,8 +403,7 @@ class ExploreController:
                     f"before starting a new one.")
             # Reset visited history for the new task so we don't carry
             # over stale cells from a prior incomplete run.
-            self._visited_cells = set()
-            self._viewed_sectors.clear()
+            self._visited_xy = set()
             handle = TaskHandle(
                 task_id="exp-" + uuid.uuid4().hex[:8],
                 started_at=reading[0] / 1e9,
@@ -328,16 +452,21 @@ class ExploreController:
 
     # ── Frontier loop (runs in its own thread per task) ─────────────
     def _run_task(self, handle: TaskHandle) -> None:
+        """The task's thread. Whatever goes wrong ends the task with an
+        error: a thread that dies quietly leaves it exploring for good, which
+        refuses every new task and any cancel."""
         try:
-            self._run_frontiers(handle)
-        except Exception as exc:
+            self._explore(handle)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[%s] exploration failed", handle.task_id)
             try:
                 if handle.nav_run_id:
                     self._nav_cancel_rpc(handle.nav_run_id)
             except Exception as cancel_error:
-                self._terminate(handle, "error", f"{exc}; {cancel_error}")
+                self._terminate(handle, "error", f"{e}; {cancel_error}")
                 return
-            self._terminate(handle, "canceled" if handle.cancel_requested else "error", str(exc))
+            self._terminate(handle, "canceled" if handle.cancel_requested else "error",
+                            f"{type(e).__name__}: {e}")
 
     def _read_reference(self, handle=None):
         reading = self._reference.read()
@@ -362,137 +491,240 @@ class ExploreController:
         while self._now(handle) < deadline:
             self._stop_evt.wait(.1)
 
-    def _run_frontiers(self, handle: TaskHandle) -> None:
-        from .frontier import (GridView, mapped_free_area_m2, pick_target,
-                                total_frontier_count)
-        log.info("[%s] exploration task starting", handle.task_id)
-        # Capture initial state once map is available.
-        gm = self._wait_for_map(timeout_s=15.0)
-        if gm is None:
-            self._terminate(handle, "error",
-                             "no /map received within 15s — is mapping running?")
-            return
-        gv = GridView.from_msg(gm)
-        handle.initial_area_m2 = mapped_free_area_m2(gv)
-        handle.last_area_m2 = handle.initial_area_m2
+    def _explore(self, handle: TaskHandle) -> None:
+        """Explore until no frontier is worth a visit, then end the task.
 
-        deadline = handle.started_at + handle.timeout_s if handle.timeout_s > 0 else None
-        previous_evidence = None
+        Each round observes the map, chooses the next step and drives there.
+        The task ends in `_interrupted` (cancel, timeout), `_next_step`
+        (done, stalled, nothing reachable) or `_drive` (navigation keeps
+        failing)."""
+        from .frontier import GridView, mapped_free_area_m2
+        log.info("[%s] exploration task starting", handle.task_id)
+        first = self._wait_for_map(timeout_s=15.0)
+        if first is None:
+            self._terminate(handle, "error",
+                            "no /map received within 15s — is mapping running?")
+            return
+        area = mapped_free_area_m2(GridView.from_msg(first))
+        handle.initial_area_m2 = handle.last_area_m2 = area
+        handle.area_at_last_progress_m2 = area
+        deadline = (handle.started_at + handle.timeout_s
+                    if handle.timeout_s > 0 else None)
 
         while True:
-            # Cancel / timeout checks.
-            if handle.cancel_requested:
-                self._terminate(handle, "canceled", "user-requested cancel")
+            end = self._interrupted(handle, deadline)
+            if end:
+                self._terminate(handle, *end)
                 return
-            now = self._now(handle)
-            if deadline is not None and now > deadline:
-                self._terminate(handle, "timeout",
-                                 f"hit {handle.timeout_s}s ceiling")
-                return
-
-            # Quiet-area check: if frontier count has been low + area
-            # hasn't grown for DONE_QUIET_SECONDS, declare done.
-            with self._lock:
-                latest = self._latest_map
-                pose_xyyaw = self._latest_pose_xyyaw
-                if (self._map_reference is None or self._map_reference[1:] != handle.reference[1:]):
-                    latest = None
-                if (self._pose_reference is None or self._pose_reference[1:] != handle.reference[1:]):
-                    pose_xyyaw = None
-            if latest is None:
+            view = self._observe(handle)
+            if view is None:
                 time.sleep(0.5)
                 continue
-            evidence = (id(latest), pose_xyyaw)
-            if evidence == previous_evidence:
-                self._stop_evt.wait(.1)
-                continue
-            previous_evidence = evidence
-            pose = (pose_xyyaw[0], pose_xyyaw[1]) if pose_xyyaw else None
-            gv = GridView.from_msg(latest)
-            cur_area = mapped_free_area_m2(gv)
-            if cur_area - handle.last_area_m2 > self.PROGRESS_AREA_DELTA_M2:
-                handle.last_progress_t = now
-            handle.last_area_m2 = cur_area
-            n_frontiers = total_frontier_count(
-                gv, min_size=self.FRONTIER_MIN_SIZE_CELLS)
-            if n_frontiers == 0 and \
-                    now - handle.last_progress_t > self.DONE_QUIET_SECONDS:
-                self._terminate(handle, "done",
-                                f"no frontiers + no progress for "
-                                f"{self.DONE_QUIET_SECONDS:.0f}s "
-                                f"(area={cur_area:.1f}m²)")
+            step = self._next_step(handle, view)
+            if step.end:
+                self._terminate(handle, *step.end)
                 return
-
-            # Pick next target.
-            if pose is None:
-                log.info("[%s] no map→base_link tf yet, waiting...",
-                          handle.task_id)
+            if step.wait:
                 time.sleep(0.5)
-                continue
-            with self._lock:
-                visited_snapshot = set(self._visited_cells)
-            target = pick_target(gv, pose,
-                                  min_size=self.FRONTIER_MIN_SIZE_CELLS,
-                                  max_distance_m=self.MAX_FRONTIER_DISTANCE_M,
-                                  visited_cells=visited_snapshot)
+            elif step.sweep:
+                handle.empty_sweeps += 1
+                self._sweep_360(handle, deadline=deadline)
+            else:
+                handle.empty_sweeps = 0
+                end = self._drive(handle, step, view, deadline)
+                if end:
+                    self._terminate(handle, *end)
+                    return
+
+    def _interrupted(self, handle: TaskHandle,
+                     deadline: Optional[float]) -> Optional[Tuple[str, str]]:
+        if handle.cancel_requested:
+            return "canceled", "user-requested cancel"
+        now = self._now(handle)
+        if deadline is not None and now > deadline:
+            return "timeout", f"hit {handle.timeout_s}s ceiling"
+        return None
+
+    def _observe(self, handle: TaskHandle) -> Optional["_View"]:
+        """The map as frontier search sees it, and the progress it shows.
+
+        Cells the robot has driven over or cannot see under itself count as
+        free and the costmap's lethal cells as occupied. mrtsp searches the
+        optimized map (map_opt.py) and ignores frontiers shorter than
+        `min_frontier_m`."""
+        from .frontier import (GridView, fill_traversed, mapped_free_area_m2,
+                               total_frontier_count)
+        with self._lock:
+            latest = self._latest_map
+            pose_xyyaw = self._latest_pose_xyyaw
+            visited_xy = set(self._visited_xy)
+            if self._map_reference is None or self._map_reference[1:] != handle.reference[1:]:
+                latest = None
+            if self._pose_reference is None or self._pose_reference[1:] != handle.reference[1:]:
+                pose_xyyaw = None
+        if latest is None:
+            return None
+        pose = pose_xyyaw[:2] if pose_xyyaw else None
+        gv = GridView.from_msg(latest)
+        visited = self._visited_cells(gv, visited_xy)
+        area = mapped_free_area_m2(gv)
+        # Growth since the last progress, so a map that grows a little every
+        # round still counts.
+        if area - handle.area_at_last_progress_m2 > self.PROGRESS_AREA_DELTA_M2:
+            handle.last_progress_t = self._now(handle)
+            handle.area_at_last_progress_m2 = area
+        handle.last_area_m2 = area
+
+        gv = fill_traversed(gv, visited | self._blind_cells(gv, pose))
+        gv = self._with_costmap(gv, latest)
+        min_size = self.FRONTIER_MIN_SIZE_CELLS
+        if self.strategy == "mrtsp":
+            from .map_opt import optimize
+            from .strategies import MRTSP_DEFAULTS
+            raw = total_frontier_count(gv, min_size=min_size)
+            gv = optimize(gv)
+            min_frontier_m = {**MRTSP_DEFAULTS, **self.mrtsp}["min_frontier_m"]
+            min_size = max(min_size, int(round(min_frontier_m / gv.resolution)))
+        frontiers = total_frontier_count(gv, min_size=min_size)
+        if self.strategy == "mrtsp":
+            log.info("[%s] frontiers raw=%d optimized=%d",
+                     handle.task_id, raw, frontiers)
+        return _View(grid=gv, pose=pose,
+                     yaw=pose_xyyaw[2] if pose_xyyaw else 0.0, area_m2=area,
+                     frontiers=frontiers, min_size=min_size, visited=visited)
+
+    def _next_step(self, handle: TaskHandle, view: "_View") -> "_Step":
+        """Where to go next, or why to stop.
+
+        Goals are asked for from the strictest to the most lenient: a near
+        frontier not tried yet, any such frontier, then a close look at one
+        still there after a visit. With none left, a run that has tried
+        every frontier ends. Otherwise mrtsp relaxes the room a goal needs
+        and falls back to a greedy goal before it ends, and greedy turns in
+        place to see more before it gives up."""
+        if view.frontiers == 0:
+            return _Step(end=("done",
+                              f"no frontiers left (area={view.area_m2:.1f}m²)"))
+        if self._now(handle) - handle.last_progress_t > self.NO_PROGRESS_TIMEOUT_S:
+            return _Step(end=("error",
+                              f"map has not grown for "
+                              f"{self.NO_PROGRESS_TIMEOUT_S:.0f}s with "
+                              f"{view.frontiers} clusters left "
+                              f"(area={view.area_m2:.1f}m²)"))
+        if view.pose is None:
+            log.info("[%s] no map→base_link tf yet, waiting...", handle.task_id)
+            return _Step(wait=True)
+
+        from .strategies import pick
+        tried = handle.failed_targets + handle.reached_targets
+        keepout = self._keepout_circles()
+
+        def goal(strategy: Optional[str] = None, **overrides):
+            args = {"keepout": keepout, "min_size": view.min_size,
+                    "visited_cells": view.visited, "blocked_xy": tried,
+                    "blocked_radius_m": self.FAILED_TARGET_RADIUS_M,
+                    "clearance_m": self.TARGET_CLEARANCE_M or self.robot_radius_m,
+                    "max_distance_m": math.inf}
+            if self.TARGET_STANDOFF_M is not None:
+                args["standoff_m"] = self.TARGET_STANDOFF_M
+            args.update(overrides)
+            return pick(strategy or self.strategy, view.grid, view.pose,
+                        robot_yaw=view.yaw, robot_radius_m=self.robot_radius_m,
+                        mrtsp=self.mrtsp, **args)
+
+        target = goal(max_distance_m=self.MAX_FRONTIER_DISTANCE_M)
+        if target is None:
+            target = goal()
+        if target is not None:
+            return _Step(target=target)
+        if handle.reached_targets:
+            # A frontier long enough to hide a passage and still there after
+            # a visit is looked at once more, from as close as the robot fits.
+            target = goal(close=True,
+                          blocked_xy=handle.failed_targets + handle.close_visits,
+                          min_size=self.CLOSE_LOOK_MIN_SIZE_CELLS)
+            if target is not None:
+                return _Step(target=target, close=True)
+        if tried and goal(blocked_xy=None) is not None:
+            # Every frontier left has been tried: done if any was reached.
+            return _Step(end=("done" if handle.reached_targets else "error",
+                              f"{view.frontiers} clusters left, all tried: "
+                              f"{len(handle.failed_targets)} unreachable, "
+                              f"{len(set(handle.reached_targets))} still there "
+                              f"after a visit"))
+        if self.strategy != "frontier_greedy":
+            # Ask with the chassis' clearance only, then for a greedy goal 1 m
+            # short of the frontier: nav2 may get through a doorway the path
+            # search reads as closed.
+            target = goal(room_margin_m=0.0)
             if target is None:
-                # No safe frontier picked, but quiet timer hasn't fired
-                # yet → the map likely doesn't have ENOUGH known-free
-                # space around the robot for the safety filter to
-                # accept a centroid. The right move is to spin in
-                # place: sweeping the lidar 360° at the current pose
-                # extends known-free + observes new walls, which makes
-                # new safe frontier candidates appear next iteration.
-                # Without this, we'd just sit and the map would never
-                # grow because nav-to-nowhere doesn't move the robot.
-                handle.detail = (f"no safe frontier; "
-                                  f"spinning to expand FOV ({n_frontiers} "
-                                  f"raw clusters detected)")
-                log.info("[%s] %s", handle.task_id, handle.detail)
-                self._sweep_360(handle, deadline=deadline)
-                # After the spin, re-evaluate immediately rather than
-                # sleeping — the map should now be richer.
-                continue
+                target = goal("frontier_greedy",
+                              blocked_xy=tried + [view.pose], standoff_m=1.0)
+            if target is not None:
+                return _Step(target=target)
+            return _Step(end=("done",
+                              f"{view.frontiers} clusters left, none reachable "
+                              f"(area={view.area_m2:.1f}m²)"))
+        if handle.empty_sweeps >= self.MAX_EMPTY_SWEEPS:
+            return _Step(end=("error",
+                              f"no reachable frontier after "
+                              f"{handle.empty_sweeps} sweeps ({view.frontiers} "
+                              f"raw clusters, {len(handle.failed_targets)} "
+                              f"failed targets)"))
+        # Frontiers but no safe goal yet: turning in place shows the lidar
+        # more free space around the robot, where a goal can then go.
+        handle.detail = (f"no safe frontier; spinning to expand FOV "
+                         f"({view.frontiers} raw clusters detected)")
+        log.info("[%s] %s", handle.task_id, handle.detail)
+        return _Step(sweep=True)
 
-            tx, ty = target.centroid_xy
-            handle.last_target_xy = (tx, ty)
-            handle.detail = (f"driving to frontier ({tx:.2f},{ty:.2f}) "
-                             f"size={target.size}, {n_frontiers} clusters left")
-            log.info("[%s] %s", handle.task_id, handle.detail)
+    def _drive(self, handle: TaskHandle, step: "_Step", view: "_View",
+               deadline: Optional[float]) -> Optional[Tuple[str, str]]:
+        """Drive to the step's goal and record the outcome. Returns why the
+        task ends, or None to go on."""
+        target = step.target
+        fx, fy = target.centroid_xy       # the frontier
+        tx, ty = target.drive_to          # where the robot stops, short of it
+        handle.last_target_xy = (fx, fy)
+        handle.detail = (f"driving to ({tx:.2f},{ty:.2f}), short of "
+                         f"frontier ({fx:.2f},{fy:.2f}) "
+                         f"size={target.size}, {view.frontiers} clusters left")
+        log.info("[%s] %s", handle.task_id, handle.detail)
 
-            leg_timeout = self._bounded_timeout(
-                self.NAV_GOAL_TIMEOUT_S, deadline)
-            if leg_timeout <= 0.0:
-                self._terminate(handle, "timeout",
-                                f"hit {handle.timeout_s}s ceiling")
-                return
-            ok, msg = self._nav_navigate_blocking(
-                tx, ty, yaw=None, timeout_s=leg_timeout,
-                cancel_evt=handle)
-            if handle.cancel_requested:
-                self._terminate(handle, "canceled", "cancel during nav")
-                return
-            if not ok:
-                # Nav failed for this leg — that's not fatal, the next
-                # frontier might be reachable. Just log + continue.
-                log.warning("[%s] nav leg failed: %s", handle.task_id, msg)
-                handle.detail = f"nav leg failed ({msg}); trying next frontier"
-                time.sleep(self.LOOP_QUIET_PERIOD_S)
-                continue
-
+        # The searched path when the strategy has one, else 1.5 times the
+        # straight line.
+        leg_m = (target.path_m if target.path_m is not None
+                 else 1.5 * math.hypot(tx - view.pose[0], ty - view.pose[1]))
+        leg_timeout = self._bounded_timeout(
+            max(self.NAV_GOAL_TIMEOUT_S, self.LEG_TIMEOUT_PER_M_S * leg_m),
+            deadline)
+        if leg_timeout <= 0.0:
+            return "timeout", f"hit {handle.timeout_s}s ceiling"
+        # Arrive facing the frontier.
+        hx, hy = (tx, ty) if (fx - tx) ** 2 + (fy - ty) ** 2 > 0.01 else view.pose
+        ok, msg = self._nav_navigate_blocking(
+            tx, ty, yaw=math.atan2(fy - hy, fx - hx),
+            timeout_s=leg_timeout, cancel_evt=handle)
+        if handle.cancel_requested:
+            return "canceled", "cancel during nav"
+        if step.close:
+            handle.close_visits.append((fx, fy))
+        if ok:
             handle.legs_completed += 1
-
-            # 360° sweep to fill camera viewing-angle coverage at the
-            # leg endpoint. Two triggers:
-            #   - the cell's covered yaw-sectors < SWEEP_MIN_SECTORS,
-            #     i.e. we haven't looked around enough here yet
-            #   - or every Nth leg as a periodic safety, in case the
-            #     coverage tracker missed something
-            if self._should_sweep(handle):
-                self._sweep_360(handle, deadline=deadline)
-
-            # Brief settle before re-evaluating frontiers.
-            self._wait_reference(self.LOOP_QUIET_PERIOD_S, handle)
+            handle.consecutive_nav_failures = 0
+            handle.reached_targets.append((fx, fy))
+        else:
+            # Not fatal: remember the frontier so it is not chosen again.
+            handle.failed_targets.append((fx, fy))
+            handle.consecutive_nav_failures += 1
+            log.warning("[%s] nav leg failed: %s (%d in a row)",
+                        handle.task_id, msg, handle.consecutive_nav_failures)
+            if handle.consecutive_nav_failures >= self.MAX_CONSECUTIVE_NAV_FAILURES:
+                return ("error", f"{handle.consecutive_nav_failures} nav legs "
+                                 f"failed in a row; last: {msg}")
+            handle.detail = f"nav leg failed ({msg}); trying next frontier"
+        self._wait_reference(self.LOOP_QUIET_PERIOD_S, handle)
+        return None
 
     def _terminate(self, handle: TaskHandle, state: str, detail: str) -> None:
         with self._lock:
@@ -511,22 +743,6 @@ class ExploreController:
         return None
 
     # ── Sweep / coverage helpers ───────────────────────────────────
-    def _should_sweep(self, handle: TaskHandle) -> bool:
-        """Decide whether to do a 360° sweep at the current pose."""
-        if handle.legs_completed <= 0 or \
-                handle.legs_completed % self.SWEEP_EVERY_N_LEGS != 0:
-            return False
-        with self._lock:
-            pose = self._latest_pose_xyyaw
-            latest = self._latest_map
-        if pose is None or latest is None:
-            return False
-        from .frontier import GridView
-        gv = GridView.from_msg(latest)
-        cx, cy = gv.world_to_cell(pose[0], pose[1])
-        sectors = self._viewed_sectors.get((cx, cy), set())
-        return len(sectors) < self.SWEEP_MIN_SECTORS
-
     def _bounded_timeout(self, requested_s: float,
                          deadline: Optional[float]) -> float:
         if deadline is None:
@@ -535,11 +751,8 @@ class ExploreController:
 
     def _sweep_360(self, handle: TaskHandle, *,
                    deadline: Optional[float]) -> None:
-        """Send 4 nav goals at the current xy with yaw advanced 90°
-        each time. Robot rotates in place 4 times → 360° sweep. The
-        camera covers all 8 sectors over those 4 stops. Per-sector
-        update is automatic via _refresh_robot_pose() ticks during
-        the rotation."""
+        """Turn in place a full circle, as four goals at the current xy with
+        the yaw advanced 90° each time, so the sensors see all around."""
         with self._lock:
             pose = self._latest_pose_xyyaw
         if pose is None:
@@ -568,6 +781,88 @@ class ExploreController:
     # endpoint URL for each contract; in practice all three point at
     # the same FastMCP server, but we keep them separate so a future
     # multi-nav setup still works.
+    def _keepout_circles(self) -> List[Tuple[float, float, float]]:
+        """Where Scene says there is furniture, as (x, y, radius) circles.
+
+        A tabletop is invisible to a lidar that passes under it, so the
+        occupancy grid calls that space free and a goal placed there ends
+        with the robot against a table leg. Scene has the object from the
+        camera; this asks for it.
+
+        Returns an empty list on any failure. The alternative -- refusing
+        to explore because an optional input is unavailable -- trades a
+        working explorer for a stricter one.
+        """
+
+        if not self._scene_endpoint:
+            return []
+        initial = self._read_reference(self._task)
+        now = initial[0] / 1e9
+        if (self._keepout_stamp is not None and self._keepout_reference == initial[1:]
+                and now - self._keepout_stamp < self.KEEPOUT_TTL_S):
+            return self._keepout_cache
+
+        with self._lock:
+            latest = self._latest_map
+        map_frame = latest.header.frame_id if latest is not None else "map"
+        resp = self._scene_mcp_call("list_objects", {})
+        if self._read_reference(self._task)[1:] != initial[1:]:
+            raise RuntimeError("Chronos reference changed during Scene request")
+        circles: List[Tuple[float, float, float]] = []
+        for obj in (resp.get("objects") or []):
+            label = str(obj.get("label") or "")
+            if label == "robot":
+                continue                      # itself, not an obstacle
+            if obj.get("frame_id") and obj.get("frame_id") != map_frame:
+                continue                      # placed in another frame
+            size_x = float(obj.get("size_x") or 0.0)
+            size_y = float(obj.get("size_y") or 0.0)
+            if size_x <= 0.0 or size_y <= 0.0:
+                continue                      # no footprint: a room or area entry
+            size_z = float(obj.get("size_z") or 0.0)
+            z = float(obj.get("z") or 0.0)
+            if size_z > 0.0 and not (z - size_z / 2 < self.KEEPOUT_ROBOT_HEIGHT_M
+                                     and z + size_z / 2 > self.KEEPOUT_FLOOR_M):
+                continue                      # above the robot, or flat on the floor
+            # Half the footprint diagonal covers the box whatever its yaw,
+            # and the chassis radius is added because the goal is where the
+            # robot's centre goes, not where its edge stops.
+            radius = (0.5 * math.hypot(size_x, size_y)
+                      + self.robot_radius_m)
+            circles.append((float(obj.get("x") or 0.0),
+                            float(obj.get("y") or 0.0), radius))
+
+        self._keepout_cache = circles
+        self._keepout_stamp = now
+        self._keepout_reference = initial[1:]
+        if circles:
+            log.info("keep-out from scene: %d object(s)", len(circles))
+        return circles
+
+    def _scene_mcp_call(self, tool: str, args: dict) -> dict:
+        """Scene is a different MCP server from navigation, so it gets its
+        own client rather than borrowing the nav one's base URL."""
+        try:
+            return _run_coroutine_sync(
+                lambda: self._scene_mcp_call_async(tool, args))
+        except Exception as error:  # noqa: BLE001
+            log.warning("scene mcp call %s failed: %s", tool, error)
+            return {}
+
+    async def _scene_mcp_call_async(self, tool: str, args: dict) -> dict:
+        import json
+
+        from fastmcp import Client
+
+        async with Client(self._scene_endpoint, timeout=5, init_timeout=2) as c:
+            result = await c.call_tool(tool, args, timeout=3)
+            if not result.content:
+                return {}
+            try:
+                return json.loads(result.content[0].text)
+            except Exception:  # noqa: BLE001
+                return {}
+
     async def _mcp_call(self, tool: str, args: dict) -> dict:
         """Single MCP tool round-trip. Async because fastmcp's client
         is async — we await inside a fresh event loop in the caller."""
@@ -592,9 +887,8 @@ class ExploreController:
                 return {"raw": txt}
 
     def _mcp_call_sync(self, tool: str, args: dict) -> dict:
-        import asyncio
         try:
-            return asyncio.run(asyncio.wait_for(self._mcp_call(tool, args), 5))
+            return _run_coroutine_sync(lambda: self._mcp_call(tool, args))
         except Exception as e:  # noqa: BLE001
             log.warning("mcp call %s failed: %s", tool, e)
             return {}
@@ -609,10 +903,9 @@ class ExploreController:
             return False, "canceled during nav"
         self._read_reference(cancel_evt)
         # Navigate.srv carries a PoseStamped (`goal`) — encode xy in
-        # position and the optional yaw as a unit quaternion in
-        # orientation. simple_nav's atlas_bridge interprets the
-        # identity quat (z=0, w=1) as "no yaw constraint", so for
-        # legs that don't care about heading we leave it identity.
+        # position and yaw as a unit quaternion in orientation. The nav
+        # service reads the identity quaternion (yaw=None) as yaw 0, not
+        # as "any heading", so callers that care must pass one.
         if yaw is not None:
             qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
         else:
@@ -646,6 +939,12 @@ class ExploreController:
             if cancel_evt.cancel_requested:
                 self._nav_cancel_rpc(run_id=run_id)
                 return False, "canceled during nav"
+            if self._goal_blocked(x, y):
+                # The goal was chosen before the camera saw what is there
+                # (a table top the lidar's map lacks). Driving on puts the
+                # robot against it; give the leg up and choose again.
+                self._nav_cancel_rpc(run_id=run_id)
+                return False, "goal now inside an obstacle in the costmap"
             sresp = self._mcp_call_sync("status", {"run_id": run_id})
             self._read_reference(cancel_evt)
             if sresp:
@@ -662,6 +961,18 @@ class ExploreController:
         self._nav_cancel_rpc(run_id=run_id)
         return False, "leg timeout"
 
+    def _goal_blocked(self, x: float, y: float) -> bool:
+        """Whether the costmap now has a lethal cell within the robot's
+        radius of the goal. False without a costmap."""
+        from .frontier import GridView, is_target_safe
+        with self._lock:
+            latest = self._latest_map
+            have = self._latest_costmap is not None
+        if not have or latest is None:
+            return False
+        gv = self._with_costmap(GridView.from_msg(latest), latest)
+        return not is_target_safe(gv, x, y, safe_radius_m=self.robot_radius_m)
+
     def _nav_cancel_rpc(self, run_id: str = "") -> None:
         deadline = time.monotonic() + 5
         self._mcp_call_sync("cancel", {"run_id": run_id})
@@ -675,6 +986,47 @@ class ExploreController:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+# A hung nav or Scene server must not hang the task: without a bound the
+# task stayed "exploring" forever, cancel could not stop it, and start()
+# refused every new task.
+MCP_CALL_TIMEOUT_S = 10.0
+
+
+def _run_coroutine_sync(make_coro) -> Any:
+    """Run the coroutine returned by make_coro() to completion, or raise
+    TimeoutError after MCP_CALL_TIMEOUT_S.
+
+    asyncio.run() refuses to start inside a running event loop, which
+    is where the MCP cancel handler calls cancel() from. In that case
+    run it on a short-lived thread with its own loop instead."""
+    import asyncio
+
+    def bounded():
+        return asyncio.wait_for(make_coro(), MCP_CALL_TIMEOUT_S)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(bounded())
+
+    result: dict = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(bounded())
+        except BaseException as e:  # noqa: BLE001
+            result["error"] = e
+
+    t = threading.Thread(target=runner, name="explore-mcp-call", daemon=True)
+    t.start()
+    t.join(MCP_CALL_TIMEOUT_S + 1.0)
+    if t.is_alive():
+        raise TimeoutError(f"mcp call did not finish in {MCP_CALL_TIMEOUT_S}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def _frontiers_left_count(latest_map: Any) -> int:
     if latest_map is None:
         return -1
@@ -692,7 +1044,6 @@ def _import_ros() -> dict:
     from rclpy.node import Node
     from rclpy.qos import (QoSProfile, ReliabilityPolicy,
                             DurabilityPolicy, HistoryPolicy)
-    from rclpy.duration import Duration
     from nav_msgs.msg import OccupancyGrid
     return {
         "rclpy": rclpy,
@@ -701,6 +1052,5 @@ def _import_ros() -> dict:
         "ReliabilityPolicy": ReliabilityPolicy,
         "DurabilityPolicy": DurabilityPolicy,
         "HistoryPolicy": HistoryPolicy,
-        "Duration": Duration,
         "OccupancyGrid": OccupancyGrid,
     }
