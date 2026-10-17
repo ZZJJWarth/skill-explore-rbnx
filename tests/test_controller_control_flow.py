@@ -46,6 +46,17 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.controller._task = handle
         return handle
 
+    def test_runtime_waits_for_reference_before_consuming_a_latched_map(self) -> None:
+        self.reading = None
+        with patch("explore_skill.controller._import_ros") as load_ros:
+            self.assertFalse(self.controller.start_runtime())
+            load_ros.assert_not_called()
+        self.reading = (0, 1, 1)
+        frame = _map_msg()
+        self.controller._on_map(frame)
+        self.assertIs(self.controller._latest_map, frame)
+        self.assertEqual(self.controller._map_reference, self.reading)
+
     def test_a_failure_in_the_task_ends_it_with_an_error(self) -> None:
         """A dead thread would leave the task exploring for good."""
         handle = self._handle()

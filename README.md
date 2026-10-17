@@ -14,6 +14,8 @@ Reference interruption ends tasks, including those without a duration limit,
 and cancels their navigation runs. Old map, pose, costmap, Scene cache and
 visited history cannot continue in a new generation. Progress deadlines stay
 frozen during a pause. A current map with no frontiers can finish immediately.
+Activation waits for reference time before subscribing to the map so that a
+latched map arriving at startup is retained.
 
 ## Quickstart
 

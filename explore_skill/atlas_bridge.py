@@ -252,28 +252,27 @@ def activate():
     by which point map / nav should be ACTIVE), then build the
     ExploreController and start the rclpy thread. Idempotent on re-entry."""
     global ctrl
-    if ctrl is not None:
-        log.info("CMD_ACTIVATE — already runnable, no-op")
-        return Ok()
-    inputs = resolve_inputs()
-    optional = resolve_optional_inputs()
-    log.info("dependencies resolved: %s (optional: %s)",
-             list(inputs.keys()), list(optional.keys()) or "none")
     try:
-        ctrl = ExploreController(
-            map_topic=inputs["map_topic"],
-            nav_navigate_endpoint=inputs["nav_navigate"],
-            nav_status_endpoint=inputs["nav_status"],
-            nav_cancel_endpoint=inputs["nav_cancel"],
-            reference=_reference_config,
-            scene_objects_endpoint=optional.get("scene_objects"),
-            strategy=_config.get("strategy"),
-            mrtsp=_config.get("mrtsp"),
-            costmap_topic=optional.get("costmap"),
-            robot_radius_m=robot_radius_from_soma(
-                optional.get("soma_footprint")),
-        )
-        ctrl.start_runtime()
+        if ctrl is None:
+            inputs = resolve_inputs()
+            optional = resolve_optional_inputs()
+            log.info("dependencies resolved: %s (optional: %s)",
+                     list(inputs.keys()), list(optional.keys()) or "none")
+            ctrl = ExploreController(
+                map_topic=inputs["map_topic"],
+                nav_navigate_endpoint=inputs["nav_navigate"],
+                nav_status_endpoint=inputs["nav_status"],
+                nav_cancel_endpoint=inputs["nav_cancel"],
+                reference=_reference_config,
+                scene_objects_endpoint=optional.get("scene_objects"),
+                strategy=_config.get("strategy"),
+                mrtsp=_config.get("mrtsp"),
+                costmap_topic=optional.get("costmap"),
+                robot_radius_m=robot_radius_from_soma(
+                    optional.get("soma_footprint")),
+            )
+        if not ctrl.start_runtime():
+            return Deferred("waiting for Chronos reference time")
     except Exception:
         try:
             if ctrl is not None:

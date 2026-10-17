@@ -193,10 +193,13 @@ class ExploreController:
         self._tf_listener = None
 
     # ── ROS runtime ─────────────────────────────────────────────────
-    def start_runtime(self) -> None:
+    def start_runtime(self) -> bool:
         """Spin up rclpy node + /map subscriber + tf2 listener."""
         if self._ros is not None:
-            return
+            return True
+        # A latched map may arrive only once; do not discard it before Chronos is ready.
+        if self._reference.read() is None:
+            return False
         self._ros = _import_ros()
         rclpy = self._ros["rclpy"]
 
@@ -234,6 +237,7 @@ class ExploreController:
                                               daemon=True)
         self._spin_thread.start()
         log.info("rclpy spinning; subscribed to map_topic=%s", self.map_topic)
+        return True
 
     def stop_runtime(self) -> None:
         try:
